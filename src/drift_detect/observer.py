@@ -32,16 +32,16 @@ _SRC_AVAILABLE = ensure_on_path()
 
 try:
     from drift_detect.compiler import (
-        REPO_ESCALATION_POLICY_REL_PATH,
         compile_contract,
         detect_branch,
+        resolve_policy_path,
     )
     from drift_detect.predicates import evaluate
 except ImportError:
     compile_contract = None
     detect_branch = None
     evaluate = None
-    REPO_ESCALATION_POLICY_REL_PATH = None
+    resolve_policy_path = None
 
 _RELEVANT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"})
 _COMMAND_SUMMARY_MAX = 160
@@ -149,10 +149,12 @@ def _cache_is_fresh(meta, repo_root):
     except OSError:
         return False
 
-    policy_path_rel = meta.get("policy_path")
-    if policy_path_rel:
+    meta_policy_path = meta.get("policy_path")
+    if meta_policy_path:
+        # 0003 개정 이후 policy_path 는 대상 레포 상대경로가 아니라 drift-detect
+        # 정책 디렉터리의 절대경로다 (compiler._load_repo_escalation_policy).
         try:
-            policy_path = repo_root / policy_path_rel
+            policy_path = Path(meta_policy_path)
             if not policy_path.is_file():
                 return False
             if policy_path.stat().st_mtime != meta.get("policy_mtime"):
@@ -164,8 +166,8 @@ def _cache_is_fresh(meta, repo_root):
     else:
         # meta 에는 정책 파일이 없었는데 지금은 생겼으면 캐시 무효
         # (docs/decisions/0001 필수 조건 4 — 정책 파일 신설도 재컴파일 대상).
-        policy_path = repo_root / REPO_ESCALATION_POLICY_REL_PATH
-        if policy_path.is_file():
+        policy_path = resolve_policy_path(repo_root) if resolve_policy_path else None
+        if policy_path is not None and policy_path.is_file():
             return False
     return True
 

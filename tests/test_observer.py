@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -49,6 +50,15 @@ class ObserverTestBase(unittest.TestCase):
             ["git", "-C", str(self.repo_root), "checkout", "-q", "-b", "feature/core-1"],
             check=True,
         )
+        # 0003 zero-footprint 이후 레포 기본 escalation 정책은 대상 레포 밖,
+        # drift-detect 쪽 정책 디렉터리에 있다. 실제 drift-detect/policies/ 의
+        # 상태에 테스트가 우연히 좌우되지 않도록 격리한다.
+        self.policy_dir = self.tmp / "policies"
+        self._policy_env_patch = mock.patch.dict(
+            os.environ, {"DRIFT_DETECT_POLICY_DIR": str(self.policy_dir)}
+        )
+        self._policy_env_patch.start()
+        self.addCleanup(self._policy_env_patch.stop)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -180,9 +190,8 @@ class TestPredicateLogging(ObserverTestBase):
         self.assertNotIn("x", json.dumps(lines[0]))
 
     def test_escalate_hit_logged(self):
-        policy_dir = self.repo_root / ".claude" / "policy"
-        policy_dir.mkdir(parents=True)
-        (policy_dir / "repo-escalation.yaml").write_text(
+        self.policy_dir.mkdir(parents=True)
+        (self.policy_dir / f"{self.repo_root.name}.yaml").write_text(
             "contract_version: 1\nscope:\n  allow:\n    - core/core/config/**\n",
             encoding="utf-8",
         )

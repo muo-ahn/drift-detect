@@ -74,7 +74,8 @@ B가 잡아낸 **캐시 무효화 결함**(정책 파일 변경을 `contract.met
 
 ### M0 (컴파일러 C1)
 
-1. 레포 기본값은 **git 추적되는 별도 정책 파일**에 둔다 (예: `.claude/policy/repo-escalation.yaml`)
+1. ~~레포 기본값은 git 추적되는 별도 정책 파일에 둔다 (`.claude/policy/repo-escalation.yaml`)~~
+   → **[0003] 으로 개정**: 대상 레포가 아니라 drift-detect 안에 레포별로 둔다 (`policies/<repo-name>.yaml`). 검토·버전 관리라는 목적은 유지하고 위치만 옮긴 것이다
 2. `contract.json` 의 `deny` 가 아닌 **별도 필드 `escalate_paths`** 로 병합한다. 저작 스키마는 불변
 3. `verdict.reason` 에 **트리거 출처**(계약 명시 / 레포 기본값)를 구분 표기한다 — B의 투명성 우려 완화
 4. `contract.meta.json` 의 추적 대상에 **정책 파일의 mtime·해시를 포함**한다 — 누락 시 캐시 미갱신 결함

@@ -1,9 +1,33 @@
+import os
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from drift_detect.compiler import compile_contract, default_plan_path
+
+
+class _IsolatedPolicyDirMixin:
+    """모든 컴파일러 테스트를 실제 drift-detect/policies/ 로부터 격리한다.
+
+    DRIFT_DETECT_POLICY_DIR 을 존재하지 않는 tmp 하위 경로로 돌려, 정책 파일이
+    실제로 존재하는지 여부(0003 개정 이후 대상 레포 밖의 실제 drift-detect
+    레포 상태)에 테스트가 우연히 좌우되지 않게 한다. 정책 병합 자체를 검증하는
+    테스트(TestRepoEscalationPolicy)는 이 디렉터리 안에 직접 파일을 써서 쓴다.
+
+    호출 순서 때문에 setUp 을 오버라이드하지 않는다 — self.tmp 는 각 테스트
+    클래스의 setUp 에서 먼저 만들어지므로, 그 뒤에 이 메서드를 명시적으로
+    불러 격리를 건다.
+    """
+
+    def _isolate_policy_dir(self):
+        self.policy_dir = Path(self.tmp) / "policies"
+        patcher = mock.patch.dict(
+            os.environ, {"DRIFT_DETECT_POLICY_DIR": str(self.policy_dir)}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
 
 def _write_plan(repo_root, branch, contract_block=None, prose_only=False):
@@ -20,11 +44,12 @@ def _write_plan(repo_root, branch, contract_block=None, prose_only=False):
     return plan_path
 
 
-class TestCompileContract(unittest.TestCase):
+class TestCompileContract(_IsolatedPolicyDirMixin, unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="drift-detect-test-")
         self.repo_root = Path(self.tmp) / "Some-Repo"
         self.repo_root.mkdir()
+        self._isolate_policy_dir()
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -189,21 +214,27 @@ class TestCompileContract(unittest.TestCase):
         self.assertEqual(contract["plan_path"], "custom-plan.md")
 
 
-class TestRepoEscalationPolicy(unittest.TestCase):
-    """docs/decisions/0001-repo-escalation-paths.md 필수 구현 조건 (M0)."""
+class TestRepoEscalationPolicy(_IsolatedPolicyDirMixin, unittest.TestCase):
+    """docs/decisions/0001-repo-escalation-paths.md 필수 구현 조건 (M0).
+
+    위치는 docs/decisions/0003-zero-footprint.md 로 개정됨 — 정책 파일은
+    대상 레포가 아니라 drift-detect 쪽 정책 디렉터리(레포별 <repo>.yaml)에 있다.
+    """
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="drift-detect-test-")
         self.repo_root = Path(self.tmp) / "Some-Repo"
         self.repo_root.mkdir()
+        self._isolate_policy_dir()
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _write_policy(self, body):
-        policy_dir = self.repo_root / ".claude" / "policy"
-        policy_dir.mkdir(parents=True, exist_ok=True)
-        (policy_dir / "repo-escalation.yaml").write_text(body, encoding="utf-8")
+        self.policy_dir.mkdir(parents=True, exist_ok=True)
+        (self.policy_dir / f"{self.repo_root.name}.yaml").write_text(
+            body, encoding="utf-8"
+        )
 
     def _write_contract_plan(self, branch="feature/esc"):
         block = (
@@ -277,7 +308,7 @@ class TestRepoEscalationPolicy(unittest.TestCase):
         # 침묵 실패 방지 (스펙 §6) — malformed 정책 파일이 흔적 없이 사라지지 않는다.
         self.assertEqual(len(contract["warnings"]), 1)
         self.assertEqual(contract["warnings"][0]["code"], "policy_parse_error")
-        self.assertIn("repo-escalation.yaml", contract["warnings"][0]["message"])
+        self.assertIn(f"{self.repo_root.name}.yaml", contract["warnings"][0]["message"])
 
     def test_policy_unsupported_version_is_fail_open_with_warning(self):
         self._write_policy(
@@ -314,6 +345,72 @@ class TestRepoEscalationPolicy(unittest.TestCase):
         self.assertIsNotNone(meta["policy_path"])  # 유효 항목이 남아 정책 자체는 살아있음
         codes = [w["code"] for w in contract["warnings"]]
         self.assertIn("policy_invalid_path", codes)
+
+    def test_policy_lives_outside_target_repo(self):
+        # 0003 zero-footprint — 정책 파일 경로가 대상 레포 트리 밖(정책
+        # 디렉터리)을 가리켜야 하고, 대상 레포 안에는 아무것도 생기지 않는다.
+        self._write_policy("contract_version: 1\nscope:\n  allow:\n    - core/common/**\n")
+        branch = self._write_contract_plan()
+
+        contract, meta = compile_contract(self.repo_root, branch=branch)
+
+        self.assertEqual(contract["status"], "ok")
+        policy_path = Path(meta["policy_path"])
+        self.assertTrue(policy_path.is_absolute())
+        self.assertEqual(policy_path.parent, self.policy_dir)
+        # 대상 레포 서브트리 밖에 있어야 한다 (repo_root.iterdir 로도 확인 가능하지만
+        # relative_to 실패로 "서브트리가 아님"을 직접 검증한다).
+        with self.assertRaises(ValueError):
+            policy_path.relative_to(self.repo_root)
+        self.assertFalse((self.repo_root / ".claude" / "policy").exists())
+
+    def test_policy_edit_changes_meta_sha256(self):
+        # [0001] 필수 조건 4 — 정책 파일을 고치면 contract.meta.json 의
+        # policy_sha256 이 바뀌어야 캐시 무효화가 성립한다.
+        self._write_policy("contract_version: 1\nscope:\n  allow:\n    - core/common/**\n")
+        branch = self._write_contract_plan()
+        _contract1, meta1 = compile_contract(self.repo_root, branch=branch)
+
+        self._write_policy(
+            "contract_version: 1\nscope:\n  allow:\n    - core/common/**\n    - core/core/config/**\n"
+        )
+        _contract2, meta2 = compile_contract(self.repo_root, branch=branch)
+
+        self.assertNotEqual(meta1["policy_sha256"], meta2["policy_sha256"])
+
+    def test_policy_dir_env_var_override(self):
+        # 요청 조건 2 — DRIFT_DETECT_POLICY_DIR 로 정책 디렉터리 자체를 덮어쓸 수 있다.
+        other_dir = Path(self.tmp) / "other-policies"
+        other_dir.mkdir()
+        (other_dir / f"{self.repo_root.name}.yaml").write_text(
+            "contract_version: 1\nscope:\n  allow:\n    - core/common/**\n",
+            encoding="utf-8",
+        )
+        branch = self._write_contract_plan()
+
+        with mock.patch.dict(os.environ, {"DRIFT_DETECT_POLICY_DIR": str(other_dir)}):
+            contract, meta = compile_contract(self.repo_root, branch=branch)
+
+        self.assertEqual(
+            contract["escalate_paths"],
+            [{"pattern": "core/common/**", "source": "repo_default"}],
+        )
+        self.assertEqual(Path(meta["policy_path"]).parent, other_dir)
+
+    def test_repo_name_path_escape_is_rejected(self):
+        # 요청 조건 6 — 경로 구분자·상위 참조가 섞인 레포 이름은 통째로 거부된다
+        # (basename 으로 슬쩍 축약해 통과시키지 않는다 — 경로 탈출 방지).
+        from drift_detect.compiler import resolve_policy_path
+
+        self.assertIsNone(resolve_policy_path(self.repo_root, repo_name="../../etc"))
+        self.assertIsNone(resolve_policy_path(self.repo_root, repo_name=".."))
+        self.assertIsNone(resolve_policy_path(self.repo_root, repo_name=""))
+        self.assertIsNone(resolve_policy_path(self.repo_root, repo_name="a/b/Some-Repo"))
+        self.assertIsNone(resolve_policy_path(self.repo_root, repo_name="a\\b"))
+        # repo_name 생략 시 repo_root.name 은 이미 구분자 없는 단일 세그먼트이므로 정상 동작.
+        path = resolve_policy_path(self.repo_root)
+        self.assertEqual(path.parent, self.policy_dir)
+        self.assertEqual(path.name, "Some-Repo.yaml")
 
 
 if __name__ == "__main__":

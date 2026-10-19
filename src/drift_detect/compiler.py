@@ -6,6 +6,7 @@
 """
 
 import hashlib
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -17,9 +18,46 @@ from drift_detect.yaml_mini import ContractParseError, parse_contract_yaml
 
 SUPPORTED_CONTRACT_VERSION = 1
 
-# 레포 기본 escalation 정책 파일 위치 (docs/decisions/0001-repo-escalation-paths.md).
-# git 추적 대상이며, 저작 스키마(계약 블록)와 무관하게 레포 전체에 적용되는 기본값이다.
-REPO_ESCALATION_POLICY_REL_PATH = Path(".claude", "policy", "repo-escalation.yaml")
+# 레포 기본 escalation 정책 파일 위치 (docs/decisions/0001-repo-escalation-paths.md,
+# 위치는 docs/decisions/0003-zero-footprint.md 로 개정). 대상 레포에는 아무 파일도
+# 만들지 않는다 — 정책은 drift-detect 소스 트리 안, 레포별로 둔다:
+#   <정책 디렉터리>/<repo basename>.yaml
+# 정책 디렉터리 기본값은 이 파일(__file__) 기준으로 drift-detect 루트를 거슬러
+# 올라가 계산한다 — 대상 레포 경로를 절대 쓰지 않는다. DRIFT_DETECT_POLICY_DIR
+# 환경변수로 디렉터리 자체를 덮어쓸 수 있다(테스트·이식성, 0003 필수 조건).
+_POLICY_DIR_ENV_VAR = "DRIFT_DETECT_POLICY_DIR"
+
+
+def _default_policy_dir():
+    """drift-detect 소스 트리 기준 정책 디렉터리 기본값.
+
+    이 파일은 <drift-detect>/src/drift_detect/compiler.py 에 있으므로
+    parents[2] 가 <drift-detect> 루트다.
+    """
+    return Path(__file__).resolve().parents[2] / "policies"
+
+
+def _policy_dir():
+    override = os.environ.get(_POLICY_DIR_ENV_VAR)
+    if override:
+        return Path(override)
+    return _default_policy_dir()
+
+
+def resolve_policy_path(repo_root, repo_name=None):
+    """레포 기본 escalation 정책 파일의 경로를 계산한다 (존재 여부는 검사하지 않는다).
+
+    repo_name 을 생략하면 repo_root 의 basename(`Path(repo_root).name`) 을 쓴다 —
+    이 경로로는 항상 구분자·상위 참조 없는 단일 세그먼트가 나온다. repo_name 을
+    명시적으로 넘긴 경우까지 포함해, 경로 구분자('/', '\\')가 섞였거나 값이
+    비었거나 `.`/`..` 면 파일명으로 신뢰하지 않고 None 을 반환한다 — basename
+    으로 슬쩍 축약하지 않고 통째로 거부한다 (경로 탈출 방지, 요청 조건 6).
+    """
+    if repo_name is None:
+        repo_name = Path(repo_root).name
+    if not repo_name or "/" in repo_name or "\\" in repo_name or repo_name in (".", ".."):
+        return None
+    return _policy_dir() / f"{repo_name}.yaml"
 
 
 def _no_contract(reason, branch=None, plan_path=None, warnings=None):
@@ -88,22 +126,25 @@ def _build_meta(plan_path, repo_root, policy_meta=None):
 
 
 def _load_repo_escalation_policy(repo_root, repo_name):
-    """레포 기본 escalation 정책 파일을 읽는다 (docs/decisions/0001).
+    """레포 기본 escalation 정책 파일을 읽는다 (docs/decisions/0001, 위치는 0003 개정).
 
     저작 스키마(계약 블록)와 같은 최소 YAML 형식을 그대로 재사용한다 — 새 파서를
     만들지 않는다 (결정문 필수 조건 1). `scope.allow` 목록을 escalation 대상
     경로로 쓴다. `deny` 는 이 정책 파일에서 의미가 없으므로 무시한다.
+
+    정책 파일은 대상 레포가 아니라 drift-detect 소스 트리 안, 레포별로 존재한다
+    (`resolve_policy_path`). 없으면 병합할 것이 없을 뿐이다 (fail-open).
 
     fail-open 이되 침묵하지 않는다 (스펙 §6) — 실패마다 사람이 고칠 수 있는
     경고를 세 번째 반환값에 남긴다. 개별 경로 무효는 그 경로만 버리고 나머지는
     살린다 (전부를 버리지 않는다). 반환: (patterns: list[str]|None,
     meta: dict|None, warnings: list[dict]).
     """
-    policy_path = repo_root / REPO_ESCALATION_POLICY_REL_PATH
-    if not policy_path.is_file():
+    policy_path = resolve_policy_path(repo_root, repo_name=repo_name)
+    if policy_path is None or not policy_path.is_file():
         return None, None, []
 
-    rel_path = _rel_or_abs(policy_path, repo_root)
+    rel_path = str(policy_path)
 
     try:
         data = policy_path.read_bytes()
