@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 가상환경
+.venv/
+venv/
+
+# 테스트·커버리지
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 런타임 상태 — 이 레포의 산출물이 아니라 대상 레포에 쓰이는 것이지만
+# 로컬 실험 시 생길 수 있으므로 방어적으로 무시한다
+.claude/state/
+
+# OS
+.DS_Store
