@@ -189,6 +189,45 @@ class TestPredicateLogging(ObserverTestBase):
         # 파일 내용(content)이 로그에 새면 안 된다.
         self.assertNotIn("x", json.dumps(lines[0]))
 
+    def _write_policy(self, body):
+        self.policy_dir.mkdir(parents=True, exist_ok=True)
+        (self.policy_dir / f"{self.repo_root.name}.yaml").write_text(body, encoding="utf-8")
+
+    def _edit_payload(self, rel):
+        return {
+            "tool_name": "Edit",
+            "tool_input": {"file_path": str(self.repo_root / rel)},
+            "cwd": str(self.repo_root),
+        }
+
+    def test_policy_deny_without_contract_logged(self):
+        self._write_policy("contract_version: 1\nscope:\n  deny:\n    - infra/**\n")
+        self._run_stdin(self._edit_payload("infra/main.tf"))
+        rec = self._log_lines()[0]
+        self.assertEqual(rec["verdict"], "deny_hit")
+        self.assertEqual(rec["matched"], "infra/**")
+        self.assertFalse(rec["has_contract"])
+        self.assertEqual(rec["contract_source"], "policy")
+        self.assertTrue(rec["policy_deny"])
+
+    def test_policy_deny_with_contract_logged_as_plan_source(self):
+        self._write_policy("contract_version: 1\nscope:\n  deny:\n    - infra/**\n")
+        _write_plan(self.repo_root, "feature/core-1", allow=["core/**"])
+        self._run_stdin(self._edit_payload("infra/main.tf"))
+        rec = self._log_lines()[0]
+        self.assertEqual(rec["verdict"], "deny_hit")
+        self.assertTrue(rec["has_contract"])
+        self.assertEqual(rec["contract_source"], "plan")
+        self.assertTrue(rec["policy_deny"])
+
+    def test_no_contract_no_policy_log_fields(self):
+        self._run_stdin(self._edit_payload("core/a.py"))
+        rec = self._log_lines()[0]
+        self.assertEqual(rec["verdict"], "clean")
+        self.assertFalse(rec["has_contract"])
+        self.assertEqual(rec["contract_source"], "none")
+        self.assertFalse(rec["policy_deny"])
+
     def test_escalate_hit_logged(self):
         self.policy_dir.mkdir(parents=True)
         (self.policy_dir / f"{self.repo_root.name}.yaml").write_text(

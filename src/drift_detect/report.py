@@ -107,9 +107,17 @@ def aggregate(records):
         verdict = r.get("verdict", "unknown")
         by_branch[branch][verdict] += 1
 
+    # 정책 deny 로만 나온 deny_hit (계약 유무 무관 — 계약 없는 작업에서도 발화한다)
+    policy_deny_hits = sum(
+        1
+        for r in records
+        if r.get("verdict") == "deny_hit" and r.get("policy_deny") is True
+    )
+
     return {
         "total": total,
         "with_contract_total": len(with_contract),
+        "policy_deny_hits": policy_deny_hits,
         "verdict_counts": dict(verdict_counts),
         "contract_verdict_counts": dict(contract_verdict_counts),
         "top_targets": {code: counter.most_common() for code, counter in top_targets.items()},
@@ -188,6 +196,12 @@ def render_text(report, top_n=_DEFAULT_TOP_N):
     other = total - sum(metrics["verdict_counts"].get(c, 0) for c in _PREDICATE_CODES)
     if other:
         lines.append(f"  {'(그 외/unknown)':16s} {other:6d}건")
+    lines.append("")
+
+    lines.append(
+        f"정책 deny 로 나온 deny_hit: {metrics.get('policy_deny_hits', 0)}건 "
+        "(계획 계약 없이도 판정되는 항목, policy_deny:true)"
+    )
     lines.append("")
 
     lines.append("--- 계약 있는 작업에서의 술어 발화율 (진짜 오탐률 후보) ---")

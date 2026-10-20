@@ -147,6 +147,27 @@ class TestAggregate(unittest.TestCase):
         self.assertIn("(unknown)", metrics["by_branch"])
 
 
+class TestPolicyDenyCount(unittest.TestCase):
+    def test_counts_only_policy_deny_hits(self):
+        policy = dict(_record("deny_hit", "infra/a.tf", has_contract=False), policy_deny=True)
+        plan_deny = dict(_record("deny_hit", "core/legacy/a.py"), policy_deny=False)
+        old_style = _record("deny_hit", "core/x.py")  # 필드 없는 구 로그
+        flag_but_clean = dict(_record("clean", "core/y.py"), policy_deny=True)
+        metrics = report.aggregate([policy, plan_deny, old_style, flag_but_clean])
+        self.assertEqual(metrics["policy_deny_hits"], 1)
+
+    def test_render_has_policy_deny_line(self):
+        rep = {
+            "generated_at": 0,
+            "since_days": None,
+            "repos": [],
+            "metrics": report.aggregate(
+                [dict(_record("deny_hit", "infra/a", has_contract=False), policy_deny=True)]
+            ),
+        }
+        self.assertIn("정책 deny 로 나온 deny_hit: 1건", report.render_text(rep))
+
+
 class TestBuildReportNoContractWarning(ReportTestBase):
     def test_zero_has_contract_true_is_flagged_in_text(self):
         _write_log(self.repo_root, [_record("clean", has_contract=False)])

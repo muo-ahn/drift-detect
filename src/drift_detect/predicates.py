@@ -3,16 +3,17 @@
 | 코드 | 조건 | 계약 필요 |
 |---|---|---|
 | allow_miss | Edit/Write 대상이 scope.allow(+implicit_allow) 밖 | 예 |
-| deny_hit | 대상이 scope.deny 에 매치 | 예 |
+| deny_hit | 대상이 scope.deny(+레포 정책 deny)에 매치 | 계약 또는 정책 deny |
 | escalate_hit | 대상이 escalate_paths 에 매치 | 예 |
 | test_unverified | worktree 테스트 명령이 shim/플래그로 정상 라우팅되지 않음 | 아니오 |
 
 모든 술어는 순수 함수다 — 입력을 받아 판정(dict 또는 None)을 반환할 뿐,
 파일을 쓰거나 프로세스 종료 코드를 바꾸지 않는다. 부작용은 observer.py 의 몫.
 
-계약 의존 3개는 contract 가 없거나 status != "ok" 이면 항상 None(무판정)이다 —
-무계약 상태에서 Tier 0 판정을 만들지 않는다(design.md §4, §6: 무계약 비차단
-불변식).
+allow_miss·escalate_hit 는 contract 가 없거나 status != "ok" 이면 항상 None
+(무판정)이다 — 작업별 범위가 없는 상태에서 판정을 만들지 않는다(design.md §4, §6:
+무계약 비차단 불변식). deny_hit 만 예외로, 계획 계약이 없어도 레포 정책의 deny
+(contract["policy_deny"], docs/decisions/0004)만으로 판정한다.
 """
 
 import os
@@ -32,6 +33,12 @@ _DB_SCHEMA_FLAG = re.compile(r"DB_SCHEMA=core_wt_")
 # GNUmakefile 을 먼저 읽으므로, 이 파일이 worktree 최상위에 있으면 메인 트리
 # Makefile 을 include 해 -w/DB_SCHEMA 를 내부에서 조립한다.
 _SHIM_FILENAME = "GNUmakefile"
+# `cd <path> &&` / `cd <path>;` / `cd <path>` + 개행 / `pushd <path> &&` 형태의 디렉터리 이동.
+# 경로는 따옴표 또는 공백/구분자 없는 토큰. 명령 선두 또는 구분자 뒤에서만 인정.
+_CD_PREFIX = re.compile(
+    r"(?:^|&&|;|\|\||\n)[ \t]*(?:cd|pushd)[ \t]+"
+    r"(\"[^\"]*\"|'[^']*'|[^\s;&|]+)[ \t]*(?:&&|;|\n)"
+)
 
 _PREDICATE_ORDER = ("deny_hit", "escalate_hit", "allow_miss")
 
@@ -51,12 +58,20 @@ def allow_miss(target, contract):
 
 
 def deny_hit(target, contract):
-    """target 이 scope.deny 의 어느 패턴에 매치하는가."""
-    if not _has_contract(contract):
+    """target 이 계획 계약 scope.deny 또는 레포 정책 deny 의 어느 패턴에 매치하는가.
+
+    두 목록의 합집합이다(계획 계약 우선 검사). 정책 deny 로만 걸린 판정에는
+    `policy_deny: True` 가 붙는다 — 로그·보고가 근거를 구분하기 위함이다.
+    """
+    if not contract:
         return None
-    for pattern in contract["scope"]["deny"]:
+    if _has_contract(contract):
+        for pattern in contract["scope"]["deny"]:
+            if matches_any(target, [pattern]):
+                return {"code": "deny_hit", "matched": pattern}
+    for pattern in contract.get("policy_deny") or []:
         if matches_any(target, [pattern]):
-            return {"code": "deny_hit", "matched": pattern}
+            return {"code": "deny_hit", "matched": pattern, "policy_deny": True}
     return None
 
 
@@ -84,6 +99,27 @@ def _make_shim_present(cwd):
         return os.path.isfile(os.path.join(cwd, _SHIM_FILENAME))
     except (OSError, ValueError):
         return None
+
+
+def _effective_dir(command, cwd, upto):
+    """command[:upto] 안의 마지막 `cd`/`pushd` 를 반영한 실효 디렉터리.
+
+    상대경로는 cwd 기준으로 푼다. 변수(`$`)·백틱·`cd -` 등 정적으로 못 푸는
+    경로, 상대경로인데 cwd 가 없는 경우는 종전 동작(cwd 그대로)으로 둔다.
+    """
+    effective = cwd
+    for match in _CD_PREFIX.finditer(command[:upto]):
+        raw = match.group(1)
+        if raw[0] in "\"'":
+            raw = raw[1:-1]
+        if not raw or raw == "-" or "$" in raw or "`" in raw:
+            continue
+        raw = os.path.expanduser(raw)
+        if os.path.isabs(raw):
+            effective = os.path.normpath(raw)
+        elif effective:
+            effective = os.path.normpath(os.path.join(effective, raw))
+    return effective
 
 
 def test_unverified(command, cwd=None):
@@ -116,14 +152,23 @@ def test_unverified(command, cwd=None):
     if not (is_make_test or is_manage_test):
         return None
 
-    in_worktree = bool(_WORKTREE_HINT.search(cwd or "")) or bool(
-        _WORKTREE_HINT.search(command)
+    # cd 로 이동한 뒤 실행되는 명령은 shim 을 cwd 가 아니라 이동 대상에서 찾아야 한다.
+    hint_match = _MAKE_TEST_HINT.search(command) or _MANAGE_TEST_HINT.search(command)
+    effective_cwd = _effective_dir(command, cwd, hint_match.start())
+
+    in_worktree = (
+        bool(_WORKTREE_HINT.search(cwd or ""))
+        or bool(_WORKTREE_HINT.search(effective_cwd or ""))
+        or bool(_WORKTREE_HINT.search(command))
     )
     if not in_worktree:
         return None
 
     if is_make_test:
-        shim_present = _make_shim_present(cwd)
+        # cd 대상이 이미 사라졌으면(삭제된 worktree) 판정 불가 — fail-open.
+        if effective_cwd != cwd and not os.path.isdir(effective_cwd):
+            return None
+        shim_present = _make_shim_present(effective_cwd)
         if shim_present is None or shim_present:
             return None
         return {"code": "test_unverified", "matched": "worktree_make_missing_shim"}

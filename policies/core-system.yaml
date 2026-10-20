@@ -1,0 +1,15 @@
+contract_version: 1
+scope:
+  deny:
+    - infra/**
+    - core/core/config/**
+    - Dockerfile
+    - Dockerfile.lambda
+    - core_grpc/Dockerfile.core-grpc
+    - docker-compose.dev.yml
+    - docker-compose.prod.yml
+    - docker-compose.stable.yml
+    - docker-compose.test.yml
+    - migration/**
+    - workflows/**
+    - .github/**
