@@ -209,6 +209,14 @@ def _append_log(repo_root, record):
         pass  # 로깅 실패가 세션을 막아서는 안 된다
 
 
+def _contract_source(contract, has_contract):
+    if has_contract:
+        return "plan"
+    if contract and contract.get("policy_deny"):
+        return "policy"
+    return "none"
+
+
 def _run(payload):
     if not isinstance(payload, dict):
         return
@@ -243,6 +251,7 @@ def _run(payload):
         target = _target_path(tool_input, repo_root)
 
     result = evaluate(target, contract, command=command, cwd=cwd)
+    has_contract = bool(contract) and contract.get("status") == "ok"
 
     record = {
         "ts": time.time(),
@@ -252,7 +261,11 @@ def _run(payload):
         "target": target if target is not None else _summarize_command(command),
         "verdict": result["code"],
         "matched": result["matched"],
-        "has_contract": bool(contract) and contract.get("status") == "ok",
+        "has_contract": has_contract,
+        # 판정 근거: plan=계획 계약, policy=계약 없이 레포 정책 deny 만 적용, none=둘 다 없음.
+        # has_contract 의미(계획 계약 존재)는 바꾸지 않는다.
+        "contract_source": _contract_source(contract, has_contract),
+        "policy_deny": bool(result.get("policy_deny")),
     }
     _append_log(repo_root, record)
 

@@ -37,8 +37,10 @@ def _indented_lines(text):
     return result
 
 
-def parse_contract_yaml(text):
+def parse_contract_yaml(text, require_allow=True):
     """contract 블록 본문 문자열을 파싱해 dict 로 반환한다.
+
+    require_allow=False 는 레포 정책 파일용이다 — deny 만 있는 파일을 허용한다.
 
     반환: {"contract_version": int, "scope": {"allow": [str, ...], "deny": [str, ...]}}
     """
@@ -114,10 +116,10 @@ def parse_contract_yaml(text):
         else:
             deny_items = items
 
-    if allow_items is None or len(allow_items) == 0:
+    if require_allow and (allow_items is None or len(allow_items) == 0):
         raise ContractParseError("scope.allow 는 1개 이상 필요")
 
     return {
         "contract_version": contract_version,
-        "scope": {"allow": allow_items, "deny": deny_items},
+        "scope": {"allow": allow_items or [], "deny": deny_items},
     }

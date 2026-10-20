@@ -188,6 +188,73 @@ class TestTestUnverified(unittest.TestCase):
         result = predicates.test_unverified(command, cwd=None)
         self.assertIsNone(result)
 
+    def _make_worktree(self, tmp, with_shim):
+        target = os.path.join(tmp, "repo", ".claude", "worktrees", "core-1929")
+        os.makedirs(target)
+        if with_shim:
+            open(os.path.join(target, "GNUmakefile"), "w").close()
+        main_tree = os.path.join(tmp, "repo")
+        return main_tree, target
+
+    def test_cd_target_with_shim_is_clean(self):
+        # 실측 오탐: cwd 는 메인 트리(shim 없음), cd 대상 worktree 에는 shim 이 있다.
+        with tempfile.TemporaryDirectory() as tmp:
+            main_tree, target = self._make_worktree(tmp, with_shim=True)
+            command = 'cd %s && make test-fast ARGS="shop" 2>&1 | tail' % target
+            self.assertIsNone(predicates.test_unverified(command, cwd=main_tree))
+
+    def test_cd_target_without_shim_fires(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            main_tree, target = self._make_worktree(tmp, with_shim=False)
+            open(os.path.join(main_tree, "GNUmakefile"), "w").close()
+            command = "cd %s && make test-fast" % target
+            result = predicates.test_unverified(command, cwd=main_tree)
+            self.assertEqual(result["matched"], "worktree_make_missing_shim")
+
+    def test_no_cd_keeps_previous_behavior(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            main_tree, target = self._make_worktree(tmp, with_shim=True)
+            result = predicates.test_unverified("make test-fast", cwd=target)
+            self.assertIsNone(result)
+            bare = os.path.join(tmp, "bare", ".claude", "worktrees", "w")
+            os.makedirs(bare)
+            result = predicates.test_unverified("make test-fast", cwd=bare)
+            self.assertEqual(result["matched"], "worktree_make_missing_shim")
+
+    def test_relative_cd_resolves_against_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            main_tree, target = self._make_worktree(tmp, with_shim=True)
+            command = "cd .claude/worktrees/core-1929; make test-fast"
+            self.assertIsNone(predicates.test_unverified(command, cwd=main_tree))
+
+    def test_quoted_and_last_cd_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            main_tree, target = self._make_worktree(tmp, with_shim=True)
+            command = 'cd /nonexistent && cd "%s" && make test-fast' % target
+            self.assertIsNone(predicates.test_unverified(command, cwd=main_tree))
+            command = "pushd '%s' && make test-fast" % target
+            self.assertIsNone(predicates.test_unverified(command, cwd=main_tree))
+
+    def test_newline_separated_cd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            main_tree, target = self._make_worktree(tmp, with_shim=True)
+            command = "cd %s\nmake test-fast" % target
+            self.assertIsNone(predicates.test_unverified(command, cwd=main_tree))
+
+    def test_cd_target_deleted_is_fail_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            main_tree, _ = self._make_worktree(tmp, with_shim=False)
+            gone = os.path.join(tmp, "repo", ".claude", "worktrees", "gone")
+            command = "cd %s && make test-fast" % gone
+            self.assertIsNone(predicates.test_unverified(command, cwd=main_tree))
+
+    def test_unresolvable_cd_falls_back_to_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            main_tree, target = self._make_worktree(tmp, with_shim=False)
+            command = "cd $WT && make test-fast # %s" % target
+            result = predicates.test_unverified(command, cwd=main_tree)
+            self.assertEqual(result["matched"], "worktree_make_missing_shim")
+
 
 class TestMakeShimPresent(unittest.TestCase):
     def test_no_cwd_returns_none(self):
@@ -245,6 +312,46 @@ class TestEvaluatePriority(unittest.TestCase):
     def test_no_target_no_command_is_clean(self):
         result = predicates.evaluate(None, NO_CONTRACT, command=None, cwd=None)
         self.assertEqual(result, {"code": "clean", "matched": None})
+
+
+class TestPolicyDenyHit(unittest.TestCase):
+    def test_no_contract_with_policy_deny_hits(self):
+        contract = dict(NO_CONTRACT, policy_deny=["infra/**"])
+        result = predicates.evaluate("infra/main.tf", contract)
+        self.assertEqual(
+            result, {"code": "deny_hit", "matched": "infra/**", "policy_deny": True}
+        )
+
+    def test_no_contract_policy_deny_miss_is_clean(self):
+        contract = dict(NO_CONTRACT, policy_deny=["infra/**"])
+        self.assertEqual(
+            predicates.evaluate("core/a.py", contract), {"code": "clean", "matched": None}
+        )
+
+    def test_no_contract_no_policy_is_unchanged(self):
+        for contract in (NO_CONTRACT, dict(NO_CONTRACT, policy_deny=[]), None):
+            self.assertIsNone(predicates.deny_hit("infra/main.tf", contract))
+            self.assertIsNone(predicates.allow_miss("infra/main.tf", contract))
+            self.assertIsNone(predicates.escalate_hit("infra/main.tf", contract))
+
+    def test_no_contract_policy_deny_does_not_enable_allow_miss_or_escalate(self):
+        contract = dict(NO_CONTRACT, policy_deny=["infra/**"])
+        self.assertIsNone(predicates.allow_miss("core/a.py", contract))
+        self.assertIsNone(predicates.escalate_hit("core/a.py", contract))
+
+    def test_contract_plus_policy_deny_union(self):
+        contract = dict(
+            _contract(allow=["**"], deny=["core/legacy/**"]), policy_deny=["infra/**"]
+        )
+        plan_hit = predicates.deny_hit("core/legacy/a.py", contract)
+        policy_hit = predicates.deny_hit("infra/a.tf", contract)
+        self.assertEqual(plan_hit, {"code": "deny_hit", "matched": "core/legacy/**"})
+        self.assertTrue(policy_hit["policy_deny"])
+        self.assertIsNone(predicates.deny_hit("core/ok.py", contract))
+
+    def test_policy_deny_wins_over_allow(self):
+        contract = dict(_contract(allow=["infra/**"]), policy_deny=["infra/**"])
+        self.assertEqual(predicates.evaluate("infra/a.tf", contract)["code"], "deny_hit")
 
 
 if __name__ == "__main__":

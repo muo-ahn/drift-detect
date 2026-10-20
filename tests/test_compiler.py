@@ -5,7 +5,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from drift_detect.compiler import compile_contract, default_plan_path
+from drift_detect.compiler import (
+    compile_contract,
+    default_plan_path,
+    resolve_policy_path,
+    resolve_repo_name,
+)
 
 
 class _IsolatedPolicyDirMixin:
@@ -297,7 +302,9 @@ class TestRepoEscalationPolicy(_IsolatedPolicyDirMixin, unittest.TestCase):
         self.assertEqual(contract["warnings"], [])
 
     def test_malformed_policy_file_is_fail_open(self):
-        self._write_policy("contract_version: 1\nscope:\n  deny:\n    - a/**\n")  # allow 없음
+        # 항목 형식 오류 ('- ' 없음). deny 만 있는 정책 파일은 이제 유효하므로
+        # (0004) "allow 없음" 은 더 이상 malformed 가 아니다.
+        self._write_policy("contract_version: 1\nscope:\n  deny:\n    a/**\n")
         branch = self._write_contract_plan()
 
         contract, meta = compile_contract(self.repo_root, branch=branch)
@@ -411,6 +418,130 @@ class TestRepoEscalationPolicy(_IsolatedPolicyDirMixin, unittest.TestCase):
         path = resolve_policy_path(self.repo_root)
         self.assertEqual(path.parent, self.policy_dir)
         self.assertEqual(path.name, "Some-Repo.yaml")
+
+
+class TestResolveRepoName(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="drift-detect-test-"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _worktree(self, gitdir_line):
+        wt = self.tmp / "Core-System" / ".claude" / "worktrees" / "core-1788"
+        wt.mkdir(parents=True, exist_ok=True)
+        (wt / ".git").write_text(gitdir_line, encoding="utf-8")
+        return wt
+
+    def test_plain_repo_uses_basename(self):
+        repo = self.tmp / "Plain-Repo"
+        (repo / ".git").mkdir(parents=True)
+        self.assertEqual(resolve_repo_name(repo), "Plain-Repo")
+
+    def test_worktree_resolves_to_main_repo_name(self):
+        main_git = self.tmp / "Core-System" / ".git"
+        wt = self._worktree(f"gitdir: {main_git}/worktrees/core-1788\n")
+        self.assertEqual(resolve_repo_name(wt), "Core-System")
+
+    def test_worktree_relative_gitdir(self):
+        wt = self._worktree("gitdir: ../../../.git/worktrees/core-1788\n")
+        self.assertEqual(resolve_repo_name(wt), "Core-System")
+
+    def test_submodule_worktree_resolves_to_module_name(self):
+        wt = self._worktree("gitdir: /top/.git/modules/Core-System/worktrees/core-2243\n")
+        self.assertEqual(resolve_repo_name(wt), "Core-System")
+
+    def test_nested_submodule_worktree_uses_last_module(self):
+        wt = self._worktree("gitdir: /top/.git/modules/a/modules/Core-System/worktrees/x\n")
+        self.assertEqual(resolve_repo_name(wt), "Core-System")
+
+    def test_submodule_main_checkout_resolves_to_module_name(self):
+        wt = self._worktree("gitdir: ../.git/modules/Core-System\n")
+        self.assertEqual(resolve_repo_name(wt), "Core-System")
+
+    def test_broken_git_file_falls_back_to_basename(self):
+        for body in ("", "garbage\n", "gitdir: /x/y/z\n", "gitdir: /a/b/worktrees/w\n"):
+            wt = self._worktree(body)
+            self.assertEqual(resolve_repo_name(wt), "core-1788", body)
+
+    def test_policy_path_uses_main_repo_name_for_worktree(self):
+        main_git = self.tmp / "Core-System" / ".git"
+        wt = self._worktree(f"gitdir: {main_git}/worktrees/core-1788\n")
+        with mock.patch.dict(os.environ, {"DRIFT_DETECT_POLICY_DIR": str(self.tmp / "p")}):
+            self.assertEqual(resolve_policy_path(wt).name, "Core-System.yaml")
+
+    def test_policy_name_lowercase_fallback_and_exact_precedence(self):
+        repo = self.tmp / "Core-System"
+        (repo / ".git").mkdir(parents=True)
+        pdir = self.tmp / "p"
+        pdir.mkdir()
+        with mock.patch.dict(os.environ, {"DRIFT_DETECT_POLICY_DIR": str(pdir)}):
+            self.assertEqual(resolve_policy_path(repo).name, "Core-System.yaml")  # 둘 다 없음
+            (pdir / "core-system.yaml").write_text("lower", encoding="utf-8")
+            # macOS 같은 대소문자 비구분 FS 에서는 정확 일치 경로가 그대로 파일을 가리킨다.
+            self.assertEqual(resolve_policy_path(repo).read_text(encoding="utf-8"), "lower")
+            (pdir / "Core-System.yaml").write_text("exact", encoding="utf-8")
+            self.assertEqual(resolve_policy_path(repo).read_text(encoding="utf-8"), "exact")
+
+
+class TestPolicyDeny(_IsolatedPolicyDirMixin, unittest.TestCase):
+    """docs/decisions/0004 — 레포 정책 scope.deny."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="drift-detect-test-")
+        self.repo_root = Path(self.tmp) / "Some-Repo"
+        self.repo_root.mkdir()
+        self._isolate_policy_dir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_policy(self, body, name="Some-Repo.yaml"):
+        self.policy_dir.mkdir(parents=True, exist_ok=True)
+        (self.policy_dir / name).write_text(body, encoding="utf-8")
+
+    def _plan(self, deny=""):
+        block = (
+            "```yaml contract\ncontract_version: 1\nscope:\n  allow:\n    - core/**\n"
+            + deny
+            + "```\n"
+        )
+        _write_plan(self.repo_root, "feature/d", contract_block=block)
+
+    def test_deny_only_policy_without_plan_yields_policy_deny(self):
+        self._write_policy("contract_version: 1\nscope:\n  deny:\n    - infra/**\n")
+        contract, _meta = compile_contract(self.repo_root, branch="feature/d")
+        self.assertEqual(contract["status"], "no_contract")
+        self.assertEqual(contract["policy_deny"], ["infra/**"])
+
+    def test_lowercase_policy_file_is_found(self):
+        self._write_policy(
+            "contract_version: 1\nscope:\n  deny:\n    - infra/**\n", name="some-repo.yaml"
+        )
+        contract, _meta = compile_contract(self.repo_root, branch="feature/d")
+        self.assertEqual(contract["policy_deny"], ["infra/**"])
+
+    def test_no_policy_gives_empty_policy_deny(self):
+        contract, _meta = compile_contract(self.repo_root, branch="feature/d")
+        self.assertEqual(contract["policy_deny"], [])
+
+    def test_plan_and_policy_deny_are_both_kept(self):
+        self._write_policy("contract_version: 1\nscope:\n  deny:\n    - infra/**\n")
+        self._plan(deny="  deny:\n    - core/legacy/**\n")
+        contract, meta = compile_contract(self.repo_root, branch="feature/d")
+        self.assertEqual(contract["status"], "ok")
+        self.assertEqual(contract["scope"]["deny"], ["core/legacy/**"])
+        self.assertEqual(contract["policy_deny"], ["infra/**"])
+        # deny 만 있는 정책도 캐시 무효화 대상으로 추적된다.
+        self.assertIsNotNone(meta["policy_sha256"])
+
+    def test_invalid_policy_deny_path_is_dropped_with_warning(self):
+        self._write_policy(
+            "contract_version: 1\nscope:\n  deny:\n    - /abs/**\n    - infra/**\n"
+        )
+        contract, _meta = compile_contract(self.repo_root, branch="feature/d")
+        self.assertEqual(contract["policy_deny"], ["infra/**"])
+        self.assertEqual(contract["warnings"][0]["code"], "policy_invalid_path")
 
 
 if __name__ == "__main__":

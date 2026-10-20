@@ -179,6 +179,10 @@ worktree 는 각자 자기 작업 트리를 가지므로 상태가 자연 격리
   대부분 `plan_stale` 로 귀결될 것이므로 **판정 라우팅이 load-bearing 이다** —
   이 발화량이 전부 사람에게 가면 경보 예산을 첫날에 소진한다
 - 술어를 돌리되 **아무것도 차단하지 않는다.** `audit/log.jsonl` 에 기록만 한다
+- **계약 없는 deny 판정 (2026-10-19, [0004](decisions/0004-policy-deny-without-contract.md))**:
+  레포 정책(`policies/<repo>.yaml`)의 `scope.deny` 는 계획 계약이 없어도 `deny_hit` 를 낸다
+  (`allow_miss`·`escalate_hit` 는 계약 필요). 로그 `contract_source`(plan|policy|none)·
+  `policy_deny`, `report` 에 별도 집계. worktree 에서도 메인 레포 이름으로 정책을 찾는다
 - **hook 은 사용자 레벨(`~/.claude/`)에 등록한다.** 프로젝트 레벨 `settings.json` 은 gitignore 되어
   worktree 체크아웃에 존재하지 않는다 — 거기 등록하면 **43개 worktree 에서 아무것도 관측하지 못한 채
   "데이터 없음"을 "오탐 0"으로 오독**하게 된다. 근거 [0002](decisions/0002-m1-deployment.md)
